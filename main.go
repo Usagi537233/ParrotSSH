@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ var (
 	requiredAttempts = flag.Int("attempts", 2, "number of consecutive identical passwords required")
 	keyFile          = flag.String("keyfile", "ssh_host_key", "host key file")
 	saveFailInfo     = flag.String("savefailinfo", "", "file to save failed attempts (IP: User: Pass)")
+	knockSeq         = flag.String("knock-seq", "", "port knocking sequence (comma-separated ports, e.g. 7000,8000,9000)")
+	knockOpen        = flag.Int("knock-open", 30, "seconds to keep SSH port open after successful knock sequence")
+	knockTimeout     = flag.Int("knock-timeout", 10, "seconds timeout for the knocking sequence")
 )
 
 type sessionState struct {
@@ -40,15 +44,25 @@ var states = struct {
 
 var failFile *os.File
 
+var knockState = struct {
+	sync.Mutex
+	m map[string]struct {
+		step     int
+		lastTime time.Time
+	}
+}{m: make(map[string]struct {
+	step     int
+	lastTime time.Time
+})}
+
+var knockSequence []int
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of ParrotSSH:\n")
 		fmt.Fprintf(os.Stderr, "  A transparent SSH proxy that requires consecutive identical passwords before forwarding to a real SSH server.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  parrotssh -listen :2222 -real 127.0.0.1:22\n")
-		fmt.Fprintf(os.Stderr, "  parrotssh -listen 192.168.1.100:2222 -real example.com:22 -attempts=3 -savefailinfo failed.log\n")
 		os.Exit(1)
 	}
 
@@ -56,6 +70,20 @@ func main() {
 
 	if *listenAddr == "" || *realSSHAddr == "" {
 		flag.Usage()
+	}
+
+	if *knockSeq != "" {
+		seqStr := strings.Split(*knockSeq, ",")
+		for _, s := range seqStr {
+			p, err := strconv.Atoi(strings.TrimSpace(s))
+			if err != nil || p <= 0 || p > 65535 {
+				log.Fatalf("Invalid knock port: %s", s)
+			}
+			knockSequence = append(knockSequence, p)
+		}
+		for _, p := range knockSequence {
+			go listenKnockPort(p)
+		}
 	}
 
 	if *saveFailInfo != "" {
@@ -78,7 +106,6 @@ func main() {
 	}
 
 	config.AddHostKey(signer)
-
 	config.ServerVersion = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"
 
 	listener, err := net.Listen("tcp", *listenAddr)
@@ -86,7 +113,6 @@ func main() {
 		log.Fatalf("listen failed: %v", err)
 	}
 	defer listener.Close()
-
 	log.Printf("ParrotSSH started")
 	log.Printf("Listening on %s → %s (requires %d consecutive identical passwords)", *listenAddr, *realSSHAddr, *requiredAttempts)
 
@@ -99,12 +125,80 @@ func main() {
 	}
 }
 
+func listenKnockPort(port int) {
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		log.Printf("Failed to listen on knock port %d: %v", port, err)
+		return
+	}
+	defer l.Close()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			continue
+		}
+		host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+		knockState.Lock()
+		entry, exists := knockState.m[host]
+		if !exists {
+			entry.step = 0
+			entry.lastTime = time.Now()
+		}
+
+		if time.Since(entry.lastTime) > time.Duration(*knockTimeout)*time.Second {
+			entry.step = 0
+		}
+
+		expected := knockSequence[entry.step]
+		if port == expected {
+			entry.step++
+			entry.lastTime = time.Now()
+			log.Printf("[%s] Port knock progress: %d/%d (%d)", host, entry.step, len(knockSequence), port)
+		} else {
+			log.Printf("[%s] Invalid knock sequence on port %d, ignoring", host, port)
+			entry.step = 0
+			entry.lastTime = time.Now()
+		}
+
+		knockState.m[host] = entry
+		knockState.Unlock()
+		conn.Close()
+	}
+}
+
+func isAllowedByKnock(ipFull string) bool {
+	if *knockSeq == "" {
+		return true
+	}
+
+	host, _, _ := net.SplitHostPort(ipFull)
+	if host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+
+	knockState.Lock()
+	defer knockState.Unlock()
+
+	entry, exists := knockState.m[host]
+	if !exists {
+		return false
+	}
+
+	if time.Since(entry.lastTime) > time.Duration(*knockOpen)*time.Second {
+		delete(knockState.m, host)
+		return false
+	}
+
+	return entry.step == len(knockSequence)
+}
+
 func passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	ipFull := conn.RemoteAddr().String()
-	ipNoPort := strings.Split(ipFull, ":")[0]
+	host, _, _ := net.SplitHostPort(ipFull)
 
 	state := getState(ipFull)
-
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -114,11 +208,8 @@ func passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions,
 	log.Printf("[%s] User %s password attempt (%d): %s", ipFull, username, state.attemptCount+1, pass)
 
 	if *saveFailInfo != "" {
-		line := fmt.Sprintf("IP: %s | User: %s | Pass: %s\n", ipNoPort, username, pass)
-		_, err := failFile.WriteString(line)
-		if err != nil {
-			log.Printf("Failed to write to save file: %v", err)
-		}
+		line := fmt.Sprintf("IP: %s | User: %s | Pass: %s\n", host, username, pass)
+		failFile.WriteString(line)
 	}
 
 	if state.attemptCount == 0 {
@@ -135,8 +226,6 @@ func passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions,
 			log.Printf("[%s] User %s passed verification (%d consecutive identical passwords), forwarding to real SSH", ipFull, username, *requiredAttempts)
 			return &ssh.Permissions{}, nil
 		}
-	} else {
-		log.Printf("[%s] User %s password mismatch, resetting attempts", ipFull, username)
 	}
 
 	state.attemptCount = 0
@@ -147,16 +236,16 @@ func passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions,
 func handle(client net.Conn, config *ssh.ServerConfig) {
 	defer client.Close()
 
+	ipFull := client.RemoteAddr().String()
+	if !isAllowedByKnock(ipFull) {
+		return
+	}
+
 	sshConn, chans, reqs, err := ssh.NewServerConn(client, config)
 	if err != nil {
 		return
 	}
 	defer sshConn.Close()
-
-	ipFull := sshConn.RemoteAddr().String()
-	ipNoPort := strings.Split(ipFull, ":")[0]
-
-	log.Printf("[%s] New connection established, user: %s", ipFull, sshConn.User())
 
 	state := getState(ipFull)
 	state.mu.Lock()
@@ -166,14 +255,6 @@ func handle(client net.Conn, config *ssh.ServerConfig) {
 
 	realConn, err := net.DialTimeout("tcp", *realSSHAddr, 10*time.Second)
 	if err != nil {
-		log.Printf("[%s] Failed to connect to real SSH: %v", ipFull, err)
-		if *saveFailInfo != "" {
-			line := fmt.Sprintf("IP: %s | User: %s | Pass: %s (connection failed)\n", ipNoPort, username, password)
-			_, err := failFile.WriteString(line)
-			if err != nil {
-				log.Printf("Failed to write to save file: %v", err)
-			}
-		}
 		return
 	}
 	defer realConn.Close()
@@ -187,20 +268,12 @@ func handle(client net.Conn, config *ssh.ServerConfig) {
 
 	realSSH, realChans, realReqs, err := ssh.NewClientConn(realConn, *realSSHAddr, clientConfig)
 	if err != nil {
-		log.Printf("[%s] Real SSH authentication failed (user: %s): %v", ipFull, username, err)
-		if *saveFailInfo != "" {
-			line := fmt.Sprintf("IP: %s | User: %s | Pass: %s (auth failed)\n", ipNoPort, username, password)
-			_, err := failFile.WriteString(line)
-			if err != nil {
-				log.Printf("Failed to write to save file: %v", err)
-			}
-		}
 		return
 	}
 	defer realSSH.Close()
-
-	log.Printf("[%s] User %s successfully connected to real backend SSH", ipFull, username)
-
+	
+     log.Printf("[%s] User %s successfully connected to real backend SSH", ipFull, username)
+     
 	go ssh.DiscardRequests(reqs)
 	go ssh.DiscardRequests(realReqs)
 
